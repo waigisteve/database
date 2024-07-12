@@ -1,0 +1,272 @@
+
+-- SQL Server Monitoring Scripts.  Some of these should be run every day and others less often, perhaps weekly or quarterly.
+--
+-- Note, these scripts are meant to be run individually.
+
+
+
+---------------------------------------------------------------------------------------------------------------------------
+-- Purpose: This query will return information about recent SQL Server Agent jobs that did not succeed.  It will run against msdb.
+USE msdb
+GO
+--This may be run to look back a day or 2.  On Mondays or returning from a holiday break, then more days may be needed.
+DECLARE @DaysBack INT = 2;
+
+SELECT 
+  sj.[name] JobName
+, sjh.step_name
+, message
+, dbo.agent_datetime(sjh.run_date, sjh.run_time) JobRunTime
+, CASE WHEN sjh.run_duration > 235959
+           THEN CAST((CAST(LEFT(CAST(sjh.run_duration AS VARCHAR), LEN(CAST(sjh.run_duration AS VARCHAR)) - 4) AS INT) / 24) AS VARCHAR) + '.' + RIGHT('00' + CAST(CAST(LEFT(CAST(sjh.run_duration AS VARCHAR), LEN(CAST(sjh.run_duration AS VARCHAR)) - 4) AS INT) % 24 AS VARCHAR), 2) + ':' + STUFF(CAST(RIGHT(CAST(sjh.run_duration AS VARCHAR), 4) AS VARCHAR(6)), 3, 0, ':')
+       ELSE STUFF(STUFF(RIGHT(REPLICATE('0', 6) + CAST(sjh.run_duration AS VARCHAR(6)), 6), 3, 0, ':'), 6, 0, ':')
+  END AS Duration
+FROM dbo.sysjobs sj
+  INNER JOIN dbo.sysjobhistory sjh ON sj.job_id = sjh.job_id
+WHERE sjh.run_status <> 1 --1 = success
+  AND dbo.agent_datetime(sjh.run_date, sjh.run_time) > DATEADD(dd, ABS(@DaysBack) * -1, SYSDATETIME())
+ORDER BY
+  sj.[name]
+, sjh.step_id
+, dbo.agent_datetime(sjh.run_date, sjh.run_time);
+
+GO
+
+---------------------------------------------------------------------------------------------------------------------------
+-- Purpose: This query will show the disk utilization of every logical volume that houses at least one database file.
+
+SELECT DISTINCT 
+  vs.volume_mount_point
+, vs.file_system_type
+, vs.logical_volume_name
+, vs.total_bytes/1073741824.0 [Total Size (GB)]
+, vs.available_bytes/1073741824.0 [Available Size (GB)] 
+, CAST(vs.available_bytes * 100. / vs.total_bytes AS DECIMAL(5,2)) AS [Space Free %] 
+FROM 
+  sys.master_files f
+    CROSS APPLY 
+  sys.dm_os_volume_stats(f.database_id, f.[file_id]) AS vs;
+
+
+---------------------------------------------------------------------------------------------------------------------------
+-- Purpose: This query will show the last successful DBCC CheckDB command for each database.
+--
+--Note:  There are 2 versions of this query. The first is preferred, but only works for SQL 2016+.
+
+SELECT 
+  [name] DBName
+, CAST(DATABASEPROPERTYEX (name, 'LastGoodCheckDbTime') AS DATETIME) LastGoodCheckDbTime
+FROM 
+  sys.databases;
+
+
+--This version will do the same thing for servers running older versions of SQL Server that are unable to use the first version of the query.
+DECLARE @Results TABLE (DBName NVARCHAR(128), ParentObject VARCHAR(100), [Object] VARCHAR(100), [Field] VARCHAR(100), [Value] VARCHAR(100));
+DECLARE @SQL NVARCHAR(4000);
+DECLARE @DBName SYSNAME;
+
+DECLARE DBList CURSOR LOCAL FAST_FORWARD FOR SELECT N'DBCC DBINFO(N''' + name + ''') WITH TABLERESULTS;', name FROM sys.databases;
+OPEN DBList;
+FETCH NEXT FROM DBList INTO @SQL, @DBName;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+  INSERT INTO @Results(ParentObject, [Object], [Field], [Value])
+  EXEC sp_ExecuteSQL @SQL;
+
+  --Mark that DBCC row with the current DB.
+  UPDATE @Results 
+  SET DBName = @DBName
+  WHERE [Field] = 'dbi_dbccLastKnownGood'
+    AND DBName IS NULL;
+
+  --Remove all the rows that aren't the new DBCC row.
+  DELETE @Results WHERE DBName IS NULL;
+
+  FETCH NEXT FROM DBList INTO @SQL, @DBName;
+END;
+
+SELECT 
+  DBName
+, [Value] dbccLastKnownGood
+FROM 
+  @Results
+ORDER BY
+  CAST([Value] AS DATETIME);
+
+GO
+---------------------------------------------------------------------------------------------------------------------------
+-- Purpose: This query will show SSRS Report executions that failed recently. It assumes the default ReportServer database name.
+--This may be run to look back a day or 2.  On Mondays or returning from a holiday break, then more days may be needed.
+USE ReportServer
+GO
+DECLARE @DaysBack INT = 2;
+
+SELECT
+  [ItemPath] --Path of the report
+, [UserName]  --Username that executed the report
+, [RequestType] --Usually Interactive (user on the screen) or Subscription
+, [Format] --RPL is the screen, could also indicate Excel, PDF, etc
+, [TimeStart]--Start time of report request
+, [TimeEnd] --Completion time of report request
+, [TimeDataRetrieval] --Time spent running queries to obtain results
+, [TimeProcessing] --Time spent preparing data in SSRS. Usually sorting and grouping.
+, [TimeRendering] --Time rendering to screen
+, [Source] --Live = query, Session = refreshed without rerunning the query, Cache = report snapshot
+, [Status] --Self explanatory
+, [RowCount] --Row count returned by a query
+, [Parameters]
+FROM 
+  dbo.ExecutionLog3
+WHERE
+  [Status] <> 'rsSuccess'
+    AND
+  TimeStart > DATEADD(dd, ABS(@DaysBack) * -1, SYSDATETIME());
+
+GO
+---------------------------------------------------------------------------------------------------------------------------
+-- Purpose: This query will show SSRS subscriptions that failed their most recent attempt. It assumes the default ReportServer database name.
+
+SELECT
+  ctg.[Path]
+, s.[Description] SubScriptionDesc
+, sj.[description] AgentJobDesc
+, s.LastStatus
+, s.DeliveryExtension
+, s.[Parameters]
+, s.LastRunTime
+FROM
+  ReportServer.dbo.[Catalog] ctg 
+    INNER JOIN 
+  ReportServer.dbo.Subscriptions s on s.Report_OID = ctg.ItemID
+    INNER JOIN
+  ReportServer.dbo.ReportSchedule rs on rs.SubscriptionID = s.SubscriptionID
+    INNER JOIN
+  msdb.dbo.sysjobs sj ON CAST(rs.ScheduleID AS sysname) = sj.name
+WHERE
+  LastStatus NOT LIKE '%Success%';
+
+
+---------------------------------------------------------------------------------------------------------------------------
+-- Purpose: This query will show messages that failed to send via DBMail.  Are there any alerts that should have gone out that didn't?
+
+DECLARE @DaysBack INT = 2;
+
+SELECT 
+  * 
+FROM 
+  msdb.dbo.sysmail_faileditems
+WHERE 
+  sent_date > DATEADD(dd, ABS(@DaysBack) * -1, SYSDATETIME());
+
+
+---------------------------------------------------------------------------------------------------------------------------
+-- Purpose: This query will find the most recent native SQL Server backup paired with the most recent differential backup.
+--          It needs to be run against msdb.  This script assumes backups are being taken to a single, unstriped file.
+
+WITH FullBackups AS (
+SELECT 
+  bset.database_name
+, fam.physical_device_name
+, bset.backup_finish_date
+, bset.backup_set_uuid
+, bset.media_set_id
+, ROW_NUMBER() OVER (PARTITION BY Database_Name ORDER BY bset.backup_set_id) RowRank
+FROM   
+  msdb.dbo.backupset bset 
+    INNER JOIN
+  msdb.dbo.backupmediafamily fam ON bset.media_set_id = fam.media_set_id
+WHERE
+  bset.type = 'D'
+    AND
+  bset.server_name = @@SERVERNAME)
+
+SELECT
+  FullBackupName = FullBackups.physical_device_name
+, DiffBackupName = famDIFF.physical_device_name
+FROM   
+  FullBackups
+    LEFT OUTER JOIN
+  msdb.dbo.backupset bsetDIFF ON FullBackups.backup_set_uuid = bsetDIFF.differential_base_guid AND bsetDiff.type = 'I'
+    LEFT OUTER JOIN
+  msdb.dbo.backupmediafamily famDIFF ON bsetDIFF.media_set_id = famDIFF.media_set_id
+WHERE 
+  FullBackups.RowRank = 1;
+
+
+---------------------------------------------------------------------------------------------------------------------------
+-- Purpose: This query will estimate the size of a differential backup compared to a full backup.
+
+-- Note: This query only works on SQL Server 2016 SP2 or newer.
+SELECT 
+  allocated_extent_page_count
+, modified_extent_page_count
+, PercentModified = CAST(modified_extent_page_count / CAST(allocated_extent_page_count AS DECIMAL(38,1)) AS DECIMAL(4,1)) * 100
+FROM 
+  sys.dm_db_file_space_usage;
+
+
+---------------------------------------------------------------------------------------------------------------------------
+-- Purpose: This query will build a list of database owners.  Use this query to find owners that do not meet best practices.
+
+SELECT 
+  d.[name] DBName
+, sp.[name] OwnerOfDB
+FROM 
+  sys.databases d
+    INNER JOIN 
+  sys.server_principals sp ON d.owner_sid = sp.sid;
+
+
+---------------------------------------------------------------------------------------------------------------------------
+-- Purpose: This query will build a list of SQL Server Agent Jobs with their owners.
+--          Use this query to find owners that do not meet best practices.
+--
+-- Note: If a job is owned by a Windows user that is no longer valid, the job will not start.
+
+SELECT 
+  sj.[name] DBName
+, sp.[name] OwnerOfDB
+FROM 
+  msdb.dbo.sysjobs sj
+    INNER JOIN 
+  sys.server_principals sp ON sj.owner_sid = sp.sid;
+
+
+---------------------------------------------------------------------------------------------------------------------------
+-- Purpose: This query will list the number of virtual log files (VLFs) in each database.
+--
+--
+-- Note: This query only works on SQL Server 2016 SP2 or newer.
+
+SELECT
+  dbs.[name] DBName
+, logStats.recovery_model
+, logStats.total_vlf_count
+--, logStats.* --There is a lot more information here that may be useful.
+FROM
+  sys.databases dbs
+    OUTER APPLY
+  sys.dm_db_log_stats (dbs.database_id) logStats;
+
+
+---------------------------------------------------------------------------------------------------------------------------
+-- Purpose: This query will show any suspect pages that SQL Server has encountered. This query should consistently return
+--          0 rows.  Any rows that do come up would be a sign of corruption.
+--
+SELECT 
+  DB_Name(database_id) DBName
+, * 
+FROM 
+  msdb.dbo.suspect_pages;
+
+
+---------------------------------------------------------------------------------------------------------------------------
+-- Purpose: This query will show all sysadmins on the instance.  Is there anyone here that doesn't belong?
+
+SELECT 
+  [name]
+FROM 
+  sys.syslogins
+WHERE 
+  IS_SRVROLEMEMBER ('sysadmin',name) = 1;
