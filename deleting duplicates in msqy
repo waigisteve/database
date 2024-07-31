@@ -1,0 +1,29 @@
+- Disable safe update mode
+SET SQL_SAFE_UPDATES = 0;
+
+-- Switch to the appropriate database
+USE humanresouce;
+
+-- Step 1: Create a temporary table with the same structure as the employees table
+DROP TEMPORARY TABLE IF EXISTS temp_employees;
+CREATE TEMPORARY TABLE temp_employees LIKE employees;
+
+-- Step 2: Insert unique records into the temporary table, keeping the lowest employee_id for each combination of fields
+INSERT INTO temp_employees (employee_id, first_name, last_name, salary, phone_number, hire_date)
+SELECT MIN(employee_id) AS employee_id, first_name, last_name, salary, phone_number, hire_date
+FROM employees
+GROUP BY first_name, last_name, salary, phone_number, hire_date;
+
+-- Step 3: Truncate the original employees table to remove all data
+TRUNCATE TABLE employees;
+
+-- Step 4: Insert back the unique records from the temporary table into the original table
+INSERT INTO employees (employee_id, first_name, last_name, salary, phone_number, hire_date)
+SELECT employee_id, first_name, last_name, salary, phone_number, hire_date
+FROM temp_employees;
+
+-- Step 5: Drop the temporary table
+DROP TEMPORARY TABLE temp_employees;
+
+-- Re-enable safe update mode (optional)
+SET SQL_SAFE_UPDATES = 1;
